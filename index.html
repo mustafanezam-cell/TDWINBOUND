@@ -359,7 +359,7 @@ const AW = (window.Appwrite && !APPWRITE_PROJECT.includes('PASTE')) ? (()=>{
 const PK_KEY='tdw_inbound_pickups_v1';
 const DOC_PREFIX='tdw_inbound_doc:';
 const DOC_MAX_BYTES=3.5*1024*1024;
-let EXTRACT_ENDPOINT='https://6a4e9d3b001482a7a2df.fra.appwrite.run';   // ← Appwrite: paste your extract function domain (https://…appwrite.global)
+let EXTRACT_ENDPOINT='https://6a4e9d3b001482a7a2df.fra.appwrite.run/';   // ← Appwrite: paste your extract function domain (https://…appwrite.global)
 if(EXTRACT_ENDPOINT.includes('PASTE')) EXTRACT_ENDPOINT='/.netlify/functions/extract';   // fallback while still on Netlify
 const EXTRACT_MAX_BYTES=4*1024*1024;    // request-size cap for PDFs/images sent to the function
 const MODEL='claude-sonnet-4-6';
@@ -927,26 +927,45 @@ $('impLoad').onclick=async ()=>{
   toast(usable.length+' document(s) loaded — review and save');
 };
 
-/* ============ bulk seed import ============ */
+/* ============ bulk seed import (rate-limit aware) ============ */
 $('impFile') && ($('impFile').onchange=async e=>{
   const f=e.target.files[0]; if(!f) return;
   let arr;
   try{ arr=JSON.parse(await f.text()); if(!Array.isArray(arr)) throw new Error('not an array'); }
   catch(err){ $('impProg').textContent='Invalid JSON file: '+err.message; return; }
   if(!AW && !db){ $('impProg').textContent='No cloud configured.'; return; }
-  let done=0, fail=0; const N=arr.length;
-  $('impProg').textContent='Importing 0 / '+N+'…';
-  const workers=Array.from({length:6},async()=>{
-    for(;;){
-      const rec=arr.shift(); if(!rec) return;
-      const ok=await upsertPickup(rec); ok?done++:fail++;
-      if((done+fail)%25===0||done+fail===N) $('impProg').textContent='Importing '+(done+fail)+' / '+N+'… ('+fail+' failed)';
+  const N=arr.length; let done=0, fail=0;
+  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+  $('impProg').textContent='Importing 0 / '+N+'… (throttled for the free tier — takes ±15-20 min, keep this tab open)';
+  for(let i=0;i<arr.length;i++){
+    const rec=arr[i];
+    let ok=false;
+    for(let attempt=1;attempt<=6 && !ok;attempt++){
+      ok=await upsertPickupQuiet(rec);
+      if(!ok){
+        $('impProg').textContent='Rate limit hit at '+(done+fail+1)+' / '+N+' — waiting 65s, then continuing automatically…';
+        await sleep(65000);
+      }
     }
-  });
-  await Promise.all(workers);
-  $('impProg').textContent='Done: '+done+' imported, '+fail+' failed.';
+    ok?done++:fail++;
+    if((done+fail)%10===0||done+fail===N) $('impProg').textContent='Importing '+(done+fail)+' / '+N+'…'+(fail?' ('+fail+' failed)':'');
+    await sleep(520);   // ~115/min, just under the limit
+  }
+  $('impProg').textContent='Done: '+done+' imported'+(fail?', '+fail+' failed':'')+'.';
   await loadPickups(); renderSaved(); toast('Seed import complete');
 });
+async function upsertPickupQuiet(rec){
+  if(AW){
+    const payload={awb:rec.awb||'', po_numbers:JSON.stringify(rec.pos.map(p=>p.poNumber)), data:JSON.stringify(rec)};
+    const did=awDocId(rec.id);
+    try{ await AW.db.updateDocument(APPWRITE_DB,APPWRITE_COLLECTION,did,payload); return true; }
+    catch(e1){
+      try{ await AW.db.createDocument(APPWRITE_DB,APPWRITE_COLLECTION,did,payload); return true; }
+      catch(e2){ return false; }
+    }
+  }
+  return upsertPickup(rec);
+}
 
 /* ============ init ============ */
 async function init(){ await loadPickups(); renderSaved(); }
