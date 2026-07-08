@@ -7,6 +7,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/appwrite@16"></script>
 <style>
   :root{
     --navy:#1F3864; --navy-700:#16294a; --steel:#3d5a8a; --paper:#f5f6f8;
@@ -314,6 +315,11 @@
     </div>
     <div style="padding:18px 20px">
       <p style="font-size:12.5px;color:var(--muted);margin:0 0 12px;line-height:1.55">Drop this pickup's documents into your Claude chat, ask Claude to extract them, and paste the JSON it returns here. It loads straight into the review view for you to check and save.</p>
+      <div style="border:1px dashed var(--line-strong);border-radius:9px;padding:12px;margin-bottom:12px;font-size:12.5px">
+        <b>Bulk seed import</b> — choose the seed JSON file (all POs load straight into the cloud):<br>
+        <input type="file" id="impFile" accept=".json" style="margin-top:8px">
+        <div id="impProg" style="font-size:12px;color:var(--muted);margin-top:6px"></div>
+      </div>
       <textarea id="impText" placeholder='Paste JSON here — an array like [ { "docType": "...", "pos": [...] }, ... ]' style="width:100%;min-height:200px;border:1px solid var(--line-strong);border-radius:9px;padding:11px 12px;font-family:var(--mono);font-size:12px;resize:vertical"></textarea>
       <div id="impErr" style="color:var(--danger);font-size:12px;min-height:16px;margin-top:6px"></div>
     </div>
@@ -339,10 +345,22 @@ const DOC_BUCKET='inbound-docs';
 const db=(window.supabase && !SUPABASE_URL.includes('YOUR') && !SUPABASE_ANON_KEY.includes('YOUR'))
   ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) : null;
 
+/* ====== APPWRITE — paste your IDs, then commit. While 'PASTE' remains, Supabase keeps working. ====== */
+const APPWRITE_ENDPOINT='https://fra.cloud.appwrite.io/v1';
+const APPWRITE_PROJECT='PASTE_PROJECT_ID';
+const APPWRITE_DB='tdw';
+const APPWRITE_COLLECTION='inbound_pickups';
+const APPWRITE_BUCKET='inbound-docs';
+const AW = (window.Appwrite && !APPWRITE_PROJECT.includes('PASTE')) ? (()=>{ 
+  const client=new Appwrite.Client().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT);
+  return { db:new Appwrite.Databases(client), st:new Appwrite.Storage(client), Q:Appwrite.Query, ID:Appwrite.ID };
+})() : null;
+
 const PK_KEY='tdw_inbound_pickups_v1';
 const DOC_PREFIX='tdw_inbound_doc:';
 const DOC_MAX_BYTES=3.5*1024*1024;
-const EXTRACT_ENDPOINT='/.netlify/functions/extract';   // path B — serverless proxy holds the API key
+let EXTRACT_ENDPOINT='PASTE_EXTRACT_FUNCTION_URL_HERE';   // ← Appwrite: paste your extract function domain (https://…appwrite.global)
+if(EXTRACT_ENDPOINT.includes('PASTE')) EXTRACT_ENDPOINT='/.netlify/functions/extract';   // fallback while still on Netlify
 const EXTRACT_MAX_BYTES=4*1024*1024;    // request-size cap for PDFs/images sent to the function
 const MODEL='claude-sonnet-4-6';
 
@@ -375,6 +393,22 @@ function mimeFromName(name){
     (e==='xlsx'||e==='xls')?'application/vnd.ms-excel':'application/octet-stream';
 }
 async function loadPickups(){
+  if(AW){
+    try{
+      const all=[]; let cursor=null;
+      for(;;){
+        const q=[AW.Q.orderDesc('$createdAt'),AW.Q.limit(100)];
+        if(cursor)q.push(AW.Q.cursorAfter(cursor));
+        const res=await AW.db.listDocuments(APPWRITE_DB,APPWRITE_COLLECTION,q);
+        all.push(...res.documents);
+        if(res.documents.length<100)break;
+        cursor=res.documents[res.documents.length-1].$id;
+      }
+      pickups=all.map(d=>{try{return JSON.parse(d.data);}catch(_){return null;}}).filter(Boolean);
+      try{localStorage.setItem(PK_KEY,JSON.stringify(pickups));}catch(_){}
+      return;
+    }catch(e){ toast('Appwrite load failed: '+(e.message||e)); }
+  }
   if(db){
     try{
       const {data,error}=await db.from('inbound_pickups').select('data').order('created_at',{ascending:false});
@@ -388,8 +422,18 @@ async function loadPickups(){
 }
 function mirrorLocal(){ try{localStorage.setItem(PK_KEY,JSON.stringify(pickups));}catch(_){} }
 async function persistPickups(){ mirrorLocal(); }   // full-array save (used by restore)
+function awDocId(id){ return String(id).replace(/[^a-zA-Z0-9._-]/g,'_').slice(0,36); }
 async function upsertPickup(rec){
   mirrorLocal();
+  if(AW){
+    const payload={awb:rec.awb||'', po_numbers:JSON.stringify(rec.pos.map(p=>p.poNumber)), data:JSON.stringify(rec)};
+    const did=awDocId(rec.id);
+    try{ await AW.db.updateDocument(APPWRITE_DB,APPWRITE_COLLECTION,did,payload); return true; }
+    catch(e1){
+      try{ await AW.db.createDocument(APPWRITE_DB,APPWRITE_COLLECTION,did,payload); return true; }
+      catch(e2){ toast('Saved locally · Appwrite sync failed: '+(e2.message||e2)); return false; }
+    }
+  }
   if(!db) return false;
   const {error}=await db.from('inbound_pickups').upsert({
     id:rec.id, created_at:rec.createdAt, awb:rec.awb||null,
@@ -399,11 +443,21 @@ async function upsertPickup(rec){
   return true;
 }
 async function deletePickupRow(id){
+  if(AW){ try{ await AW.db.deleteDocument(APPWRITE_DB,APPWRITE_COLLECTION,awDocId(id)); }catch(_){} return; }
   if(!db) return;
   try{ await db.from('inbound_pickups').delete().eq('id',id); }catch(_){}
 }
 async function storeDoc(id,base64,name){
-  if(!db||!base64) return null;
+  if(!base64) return null;
+  if(AW){
+    try{
+      const bytes=Uint8Array.from(atob(base64),c=>c.charCodeAt(0));
+      const f=new File([bytes],(name||'file'),{type:mimeFromName(name)});
+      const res=await AW.st.createFile(APPWRITE_BUCKET,AW.ID.unique(),f);
+      return 'aw:'+res.$id;
+    }catch(e){ return null; }
+  }
+  if(!db) return null;
   try{
     const bytes=Uint8Array.from(atob(base64),c=>c.charCodeAt(0));
     const path=id+'/'+(name||'file');
@@ -413,7 +467,12 @@ async function storeDoc(id,base64,name){
   }catch(e){ return null; }
 }
 async function getDocUrl(path){
-  if(!db||!path) return null;
+  if(!path) return null;
+  if(path.startsWith('aw:')){
+    if(!AW) return null;
+    try{ return AW.st.getFileView(APPWRITE_BUCKET,path.slice(3)).toString(); }catch(e){ return null; }
+  }
+  if(!db) return null;
   try{ const {data,error}=await db.storage.from(DOC_BUCKET).createSignedUrl(path,3600); if(error)throw error; return data.signedUrl; }
   catch(e){ return null; }
 }
@@ -867,6 +926,27 @@ $('impLoad').onclick=async ()=>{
   buildDraft(usable);
   toast(usable.length+' document(s) loaded — review and save');
 };
+
+/* ============ bulk seed import ============ */
+$('impFile') && ($('impFile').onchange=async e=>{
+  const f=e.target.files[0]; if(!f) return;
+  let arr;
+  try{ arr=JSON.parse(await f.text()); if(!Array.isArray(arr)) throw new Error('not an array'); }
+  catch(err){ $('impProg').textContent='Invalid JSON file: '+err.message; return; }
+  if(!AW && !db){ $('impProg').textContent='No cloud configured.'; return; }
+  let done=0, fail=0; const N=arr.length;
+  $('impProg').textContent='Importing 0 / '+N+'…';
+  const workers=Array.from({length:6},async()=>{
+    for(;;){
+      const rec=arr.shift(); if(!rec) return;
+      const ok=await upsertPickup(rec); ok?done++:fail++;
+      if((done+fail)%25===0||done+fail===N) $('impProg').textContent='Importing '+(done+fail)+' / '+N+'… ('+fail+' failed)';
+    }
+  });
+  await Promise.all(workers);
+  $('impProg').textContent='Done: '+done+' imported, '+fail+' failed.';
+  await loadPickups(); renderSaved(); toast('Seed import complete');
+});
 
 /* ============ init ============ */
 async function init(){ await loadPickups(); renderSaved(); }
