@@ -347,8 +347,8 @@ const db=(window.supabase && !SUPABASE_URL.includes('YOUR') && !SUPABASE_ANON_KE
 
 /* ====== APPWRITE — paste your IDs, then commit. While 'PASTE' remains, Supabase keeps working. ====== */
 const APPWRITE_ENDPOINT='https://fra.cloud.appwrite.io/v1';
-const APPWRITE_PROJECT='PASTE_PROJECT_ID';
-const APPWRITE_DB='tdw';
+const APPWRITE_PROJECT='6a4c1389003c9c35dfd0';
+const APPWRITE_DB='6a4c17e40014a1e1c3f5';
 const APPWRITE_COLLECTION='inbound_pickups';
 const APPWRITE_BUCKET='inbound-docs';
 const AW = (window.Appwrite && !APPWRITE_PROJECT.includes('PASTE')) ? (()=>{ 
@@ -359,7 +359,7 @@ const AW = (window.Appwrite && !APPWRITE_PROJECT.includes('PASTE')) ? (()=>{
 const PK_KEY='tdw_inbound_pickups_v1';
 const DOC_PREFIX='tdw_inbound_doc:';
 const DOC_MAX_BYTES=3.5*1024*1024;
-let EXTRACT_ENDPOINT='PASTE_EXTRACT_FUNCTION_URL_HERE';   // ← Appwrite: paste your extract function domain (https://…appwrite.global)
+let EXTRACT_ENDPOINT='https://6a4e9d3b001482a7a2df.fra.appwrite.run';   // ← Appwrite: paste your extract function domain (https://…appwrite.global)
 if(EXTRACT_ENDPOINT.includes('PASTE')) EXTRACT_ENDPOINT='/.netlify/functions/extract';   // fallback while still on Netlify
 const EXTRACT_MAX_BYTES=4*1024*1024;    // request-size cap for PDFs/images sent to the function
 const MODEL='claude-sonnet-4-6';
