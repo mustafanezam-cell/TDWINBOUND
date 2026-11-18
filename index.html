@@ -561,7 +561,10 @@ drop.onclick=()=>$('fileInput').click();
 $('fileInput').addEventListener('change',e=>{ handleFiles([...e.target.files]); e.target.value=''; });
 ['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over');}));
 ['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();if(ev==='drop'||!drop.contains(e.relatedTarget))drop.classList.remove('over');}));
-drop.addEventListener('drop',e=>{ if(e.dataTransfer&&e.dataTransfer.files.length) handleFiles([...e.dataTransfer.files]); });
+drop.addEventListener('drop',e=>{
+  if(e.dataTransfer&&e.dataTransfer.files.length){ handleFiles([...e.dataTransfer.files]); return; }
+  toast('Nothing received. Dragging straight from Outlook does not work — drag the e-mail to your Desktop first (makes a .msg file), then drop that file here.');
+});
 
 async function handleFiles(files){
   if(!files.length) return;
