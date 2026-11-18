@@ -384,12 +384,14 @@ let search='';
 /* ============ gate ============ */
 function tryGate(){
   const v=$('gPass').value;
-  if(v===TEAM_PASSWORD){ sessionStorage && (window.__ok=1); $('gate').style.display='none'; $('app').style.display='block'; init(); }
+  if(v===TEAM_PASSWORD){ sessionStorage && (window.__ok=1); try{localStorage.setItem('tdw_unlocked','1');}catch(_){} $('gate').style.display='none'; $('app').style.display='block'; init(); }
   else { $('gErr').textContent='Wrong password.'; $('gPass').value=''; $('gPass').focus(); }
 }
 $('gBtn').onclick=tryGate;
 $('gPass').addEventListener('keydown',e=>{if(e.key==='Enter')tryGate();});
 $('gPass').focus();
+/* remember this browser after the first correct password (so it opens straight to the dashboard) */
+setTimeout(()=>{ try{ if(localStorage.getItem('tdw_unlocked')==='1'){ $('gate').style.display='none'; $('app').style.display='block'; init(); } }catch(_){} },0);
 
 /* ============ storage (Supabase shared + localStorage mirror) ============ */
 function mimeFromName(name){
