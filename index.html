@@ -253,6 +253,12 @@
 
   <div id="reviewArea"></div>
 
+  <!-- pickup requests (live) -->
+  <div class="sec-h"><h2>📅 Pickup requests <span id="pkReqCount" style="font-size:12px;color:var(--muted);font-weight:500"></span></h2>
+    <div class="rt"><span id="pkLive" style="font-size:11.5px;color:var(--muted)"></span>
+      <button class="btn-ghost" id="pkRefresh" style="border:1px solid var(--line-strong);margin-left:8px">↻ Refresh</button></div></div>
+  <div class="panel" style="padding:0;margin-bottom:22px;overflow:auto;max-height:340px"><div id="pkReqList"></div></div>
+
   <!-- saved pickups -->
   <div class="sec-h">
     <h2>Stored pickups</h2>
@@ -353,7 +359,7 @@ const APPWRITE_COLLECTION='inbound_pickups';
 const APPWRITE_BUCKET='inbound-docs';
 const AW = (window.Appwrite && !APPWRITE_PROJECT.includes('PASTE')) ? (()=>{ 
   const client=new Appwrite.Client().setEndpoint(APPWRITE_ENDPOINT).setProject(APPWRITE_PROJECT);
-  return { db:new Appwrite.Databases(client), st:new Appwrite.Storage(client), Q:Appwrite.Query, ID:Appwrite.ID };
+  return { client, db:new Appwrite.Databases(client), st:new Appwrite.Storage(client), Q:Appwrite.Query, ID:Appwrite.ID };
 })() : null;
 
 const PK_KEY='tdw_inbound_pickups_v1';
@@ -830,6 +836,69 @@ function pickupMatches(p,q){
 }
 function basePO(n){ return String(n||'').trim().replace(/\s+/g,'').split('-')[0]; }
 function fmtNL(iso){ if(!iso) return ''; const m=String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/); return m?`${m[3]}-${m[2]}-${m[1]}`:iso; }
+/* ---- one entry point for every pickup/ready notice (email drop, scheduled check, manual) ---- */
+async function tdwAddPickup(poNumber,dateISO,requestedBy,source){
+  const n=String(poNumber||'').trim(); if(!n) return {ok:false,msg:'no PO'};
+  const clean=n.replace(/\s+/g,''), b=basePO(n);
+  let recs=pickups.filter(p=>(p.pos||[]).some(po=>{const pn=String(po.poNumber||'').replace(/\s+/g,''); return pn===clean||basePO(pn)===b;}));
+  let created=false;
+  if(!recs.length){
+    const rec={ id:uid(), createdAt:new Date().toISOString(), savedAt:new Date().toISOString(), awb:'',
+      transportCost:null, transportCurrency:'USD', source:'email',
+      pos:[{ poNumber:n, supplier:requestedBy||'', dg:false, weightKg:null, dims:null, pieces:null, lines:[] }], dgDocs:[], docs:[] };
+    pickups.unshift(rec); recs=[rec]; created=true;
+  }
+  let saved=0, unchanged=0;
+  for(const rec of recs){
+    if(!created && rec.pickupDate===(dateISO||null) && rec.pickupDate){ unchanged++; continue; }
+    if(dateISO) rec.pickupDate=dateISO;
+    rec.pickupRequestedBy=requestedBy||rec.pickupRequestedBy||''; rec.pickupSource=source||rec.pickupSource||'';
+    rec.pickupLoggedAt=new Date().toISOString();
+    if(await upsertPickup(rec)) saved++;
+  }
+  mirrorLocal(); renderSaved();
+  return {ok:true, po:n, created, saved, unchanged};
+}
+window.tdwAddPickup=tdwAddPickup;
+window.tdwReady=()=>Array.isArray(pickups) && window.__tdwLoaded===true;
+
+function renderPickupReq(){
+  const el=$('pkReqList'); if(!el) return;
+  const rows=pickups.filter(p=>p.pickupDate).sort((a,b)=>String(b.pickupDate).localeCompare(String(a.pickupDate)));
+  $('pkReqCount').textContent=rows.length?('· '+rows.length):'';
+  if(!rows.length){ el.innerHTML='<div style="padding:16px;color:var(--muted);font-size:13px">No pickup requests yet — drop an e-mail (.msg) above, or wait for the next mailbox check.</div>'; return; }
+  const today=new Date().toISOString().slice(0,10);
+  el.innerHTML='<table class="mini-tbl" style="width:100%"><thead><tr><th>Ready / pickup date</th><th>PO</th><th>Supplier</th><th>Requested by</th><th>Vessel</th><th>Country</th><th>Logged</th></tr></thead><tbody>'+
+    rows.map(p=>{
+      const po=(p.pos&&p.pos[0])||{};
+      const d=String(p.pickupDate).slice(0,10);
+      const col=d<today?'var(--danger)':(d===today?'#7a4d00':'#1e5e20');
+      return `<tr><td class="m" style="font-weight:700;color:${col};cursor:pointer" data-setdate="${p.id}" title="click to change">📅 ${esc(fmtNL(d))}</td>
+        <td class="m"><b>${esc(p.pos.map(x=>x.poNumber).join(', '))}</b>${po.dg?' <span class="chip dg">DG</span>':''}</td>
+        <td>${esc(po.supplier||'')}</td><td>${esc(p.pickupRequestedBy||'')}</td>
+        <td>${esc(p.vessel||'')}</td><td>${esc(p.country||'')}</td>
+        <td class="m" style="color:var(--muted)">${p.pickupLoggedAt?esc(new Date(p.pickupLoggedAt).toLocaleString()):''}</td></tr>`;
+    }).join('')+'</tbody></table>';
+}
+
+/* ---- live updates: anyone's change shows up for the whole team without refreshing ---- */
+let _rtTimer=null;
+function startRealtime(){
+  if(!AW||!AW.client||!AW.client.subscribe) return;
+  try{
+    AW.client.subscribe('databases.'+APPWRITE_DB+'.collections.'+APPWRITE_COLLECTION+'.documents',ev=>{
+      try{
+        const doc=ev.payload||{}; const isDel=(ev.events||[]).some(e=>/\.delete$/.test(e));
+        let rec=null; try{ rec=JSON.parse(doc.data); }catch(_){}
+        if(isDel){ if(rec) pickups=pickups.filter(x=>x.id!==rec.id); }
+        else if(rec){ const i=pickups.findIndex(x=>x.id===rec.id); if(i>=0) pickups[i]=rec; else pickups.unshift(rec); }
+        clearTimeout(_rtTimer); _rtTimer=setTimeout(()=>{ renderSaved(); const l=$('pkLive'); if(l) l.textContent='● live · updated '+new Date().toLocaleTimeString(); },400);
+      }catch(_){}
+    });
+    const l=$('pkLive'); if(l) l.textContent='● live';
+  }catch(_){}
+}
+
 async function applyPickupRequest(r){
   const q=(r.result&&r.result.pickupRequest)||{};
   const date=q.pickupDate||null;
@@ -879,6 +948,7 @@ async function editPickupDate(id){
   toast(rec.pickupDate?'Pickup date set':'Pickup date cleared');
 }
 function renderSaved(){
+  renderPickupReq();
   const list=pickups.filter(p=>pickupMatches(p,search));
   $('emptyState').style.display=pickups.length?'none':'block';
   if(!pickups.length){ $('savedList').innerHTML=''; updateFoot(); return; }
@@ -1046,7 +1116,8 @@ async function upsertPickupQuiet(rec){
 }
 
 /* ============ init ============ */
-async function init(){ await loadPickups(); renderSaved(); }
+async function init(){ await loadPickups(); window.__tdwLoaded=true; renderSaved(); startRealtime();
+  const rb=$('pkRefresh'); if(rb) rb.onclick=async()=>{ rb.disabled=true; await loadPickups(); renderSaved(); rb.disabled=false; toast('Refreshed'); }; }
 </script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
 <script src="ci_builder.js"></script>
