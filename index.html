@@ -242,11 +242,11 @@
   <div id="inboundTab">
   <!-- dropzone -->
   <div class="drop" id="drop">
-    <input type="file" id="fileInput" multiple accept=".pdf,.docx,.xlsx,.xls,.png,.jpg,.jpeg" style="display:none">
+    <input type="file" id="fileInput" multiple accept=".pdf,.docx,.xlsx,.xls,.png,.jpg,.jpeg,.msg,.eml" style="display:none">
     <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 16V4m0 0 4 4m-4-4L8 8"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
     <div class="big">Drop all documents for one pickup</div>
     <div class="sm">CPLs, commercial invoices, packing lists, the DHL invoice, and any MSDS / SDS / test reports — all together.</div>
-    <div class="types">PDF · DOCX · XLSX · XLS · PNG · JPG</div>
+    <div class="types">PDF · DOCX · XLSX · XLS · PNG · JPG · MSG · EML</div>
   </div>
 
   <div class="proc" id="proc"></div>
@@ -512,7 +512,26 @@ async function fileToContentBlock(file){
     const res=await mammoth.extractRawText({arrayBuffer:buf});
     return {kind:'text', text:res.value, block:{type:'text',text:'Document filename: '+file.name+'\n\n'+res.value}};
   }
+  if(ext==='eml'){
+    const buf=await readAsArrayBuffer(file);
+    const text=new TextDecoder('utf-8').decode(buf);
+    return {kind:'text', text, block:{type:'text',text:'Email file (.eml): '+file.name+'\n\n'+text.slice(0,60000)}};
+  }
+  if(ext==='msg'){
+    const buf=await readAsArrayBuffer(file);
+    const text=msgToText(buf);
+    if(!text || text.length<40) throw new Error('Could not read this .msg — save the email as .eml (File > Save as) or PDF and drop that.');
+    return {kind:'text', text, block:{type:'text',text:'Outlook email file (.msg), decoded text (may contain junk fragments): '+file.name+'\n\n'+text.slice(0,60000)}};
+  }
   throw new Error('Unsupported file type: .'+ext);
+}
+/* crude but effective: Outlook .msg stores subject/body as UTF-16LE strings */
+function msgToText(buf){
+  let s='';
+  try{ s=new TextDecoder('utf-16le').decode(new Uint8Array(buf)); }catch(_){ return ''; }
+  const runs=s.match(/[\x20-\x7E\u00A0-\u024F\u20AC\n\r\t]{5,}/g)||[];
+  const keep=runs.filter(t=>/[aeiouAEIOU0-9@]/.test(t));
+  return keep.join('\n').replace(/\r/g,'').replace(/\n{3,}/g,'\n\n').slice(0,80000);
 }
 
 /* ============ extraction (via Netlify function → Anthropic) ============ */
@@ -546,7 +565,7 @@ drop.addEventListener('drop',e=>{ if(e.dataTransfer&&e.dataTransfer.files.length
 
 async function handleFiles(files){
   if(!files.length) return;
-  const supported=['pdf','docx','xlsx','xls','png','jpg','jpeg'];
+  const supported=['pdf','docx','xlsx','xls','png','jpg','jpeg','msg','eml'];
   files=files.filter(f=>supported.includes(extOf(f.name)));
   if(!files.length){ toast('No supported files in that drop.'); return; }
 
@@ -575,12 +594,14 @@ async function handleFiles(files){
       r.el.innerHTML=`<span class="dtag err">error</span> ${esc(msg)}`;
     }
   }
-  buildDraft(rows.filter(r=>r.result));
+  const prRows=rows.filter(r=>r.result && r.result.docType==='pickup_request');
+  for(const r of prRows){ await applyPickupRequest(r); }
+  buildDraft(rows.filter(r=>r.result && r.result.docType!=='pickup_request'));
 }
 
 function tagFor(t){
   const map={commercial_invoice:['po','commercial invoice'],cpl:['po','CPL'],packing_list:['po','packing list'],
-    dhl_invoice:['dhl','DHL invoice'],msds:['dg','MSDS'],sds:['dg','SDS'],test_report:['dg','test report'],unknown:['unk','unknown']};
+    dhl_invoice:['dhl','DHL invoice'],pickup_request:['dhl','📅 pickup request'],msds:['dg','MSDS'],sds:['dg','SDS'],test_report:['dg','test report'],unknown:['unk','unknown']};
   const m=map[t]||['unk',t||'?']; return `<span class="dtag ${m[0]}">${esc(m[1])}</span> extracted`;
 }
 
@@ -804,6 +825,49 @@ function pickupMatches(p,q){
   if((p.awb||'').toLowerCase().includes(q))return true;
   return p.pos.some(po=>po.poNumber.toLowerCase().includes(q)||(po.supplier||'').toLowerCase().includes(q));
 }
+function basePO(n){ return String(n||'').trim().replace(/\s+/g,'').split('-')[0]; }
+function fmtNL(iso){ if(!iso) return ''; const m=String(iso).match(/^(\d{4})-(\d{2})-(\d{2})/); return m?`${m[3]}-${m[2]}-${m[1]}`:iso; }
+async function applyPickupRequest(r){
+  const q=(r.result&&r.result.pickupRequest)||{};
+  const date=q.pickupDate||null;
+  const poNums=(q.poNumbers||[]).map(x=>String(x).trim()).filter(Boolean);
+  if(!poNums.length){ r.el.innerHTML='<span class="dtag err">pickup request</span> no PO number found in this email'; return; }
+  const matched=[], missing=[];
+  for(const n of poNums){
+    const clean=n.replace(/\s+/g,''), b=basePO(n);
+    const hits=pickups.filter(p=>(p.pos||[]).some(po=>{const pn=String(po.poNumber||'').replace(/\s+/g,''); return pn===clean||basePO(pn)===b;}));
+    if(hits.length) hits.forEach(h=>{ if(!matched.includes(h)) matched.push(h); });
+    else missing.push(n);
+  }
+  let saved=0;
+  for(const rec of matched){
+    rec.pickupDate=date; rec.pickupRequestedBy=q.requestedBy||q.from||''; rec.pickupSource=r.file.name;
+    if(await upsertPickup(rec)) saved++;
+  }
+  mirrorLocal(); renderSaved();
+  const parts=[];
+  parts.push(date?('📅 '+esc(fmtNL(date))):'<span style="color:var(--danger)">no date found — click 📅 on the PO to set it</span>');
+  parts.push('→ <b>'+matched.length+'</b> PO(s) updated');
+  if(missing.length) parts.push('<span style="color:var(--danger)">not in system: '+esc(missing.join(', '))+'</span>');
+  r.el.innerHTML='<span class="dtag dhl">pickup request</span> '+parts.join(' · ');
+  if(matched.length) toast('Pickup date saved on '+matched.length+' PO(s)');
+}
+async function editPickupDate(id){
+  const rec=pickups.find(x=>x.id===id); if(!rec) return;
+  const cur=rec.pickupDate?fmtNL(rec.pickupDate):'';
+  const v=prompt('Pickup date (DD-MM-YYYY) — leave empty to clear:',cur);
+  if(v===null) return;
+  const t=v.trim();
+  if(!t){ rec.pickupDate=null; }
+  else{
+    const m=t.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{2,4})$/);
+    if(!m){ toast('Use DD-MM-YYYY'); return; }
+    const yy=m[3].length===2?('20'+m[3]):m[3];
+    rec.pickupDate=`${yy}-${String(m[2]).padStart(2,'0')}-${String(m[1]).padStart(2,'0')}`;
+  }
+  await upsertPickup(rec); mirrorLocal(); renderSaved();
+  toast(rec.pickupDate?'Pickup date set':'Pickup date cleared');
+}
 function renderSaved(){
   const list=pickups.filter(p=>pickupMatches(p,search));
   $('emptyState').style.display=pickups.length?'none':'block';
@@ -821,6 +885,7 @@ function renderSaved(){
           ${dgCount?`<span style="color:var(--dg)"><b>${dgCount}</b> DG</span>`:''}
           ${p.transportCost!=null?`<span>transport <b>${esc(p.transportCost)}</b> ${esc(p.transportCurrency||'')}</span>`:''}
           ${miss?`<span style="color:var(--danger)"><b>${miss}</b> missing HS/COO</span>`:''}
+          ${p.pickupDate?`<span class="pkdate" data-setdate="${p.id}" title="click to change pickup date" style="color:#1e5e20;font-weight:700;cursor:pointer">📅 pickup ${esc(fmtNL(p.pickupDate))}</span>`:`<span class="pkdate" data-setdate="${p.id}" title="set pickup date" style="color:var(--muted);cursor:pointer">📅</span>`}
           <span>${new Date(p.createdAt).toLocaleDateString()}</span>
         </div>
         <button class="icon-btn del" data-del="${p.id}" title="delete pickup"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg></button>
@@ -830,8 +895,11 @@ function renderSaved(){
   }).join('');
 
   document.querySelectorAll('.pk-main').forEach(el=>el.onclick=e=>{
-    if(e.target.closest('[data-del]'))return;
+    if(e.target.closest('[data-del]')||e.target.closest('[data-setdate]'))return;
     el.closest('.pk-row').classList.toggle('open');
+  });
+  document.querySelectorAll('[data-setdate]').forEach(b=>b.onclick=e=>{
+    e.stopPropagation(); editPickupDate(b.getAttribute('data-setdate'));
   });
   document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async e=>{
     e.stopPropagation();
