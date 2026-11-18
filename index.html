@@ -835,12 +835,19 @@ async function applyPickupRequest(r){
   const date=q.pickupDate||null;
   const poNums=(q.poNumbers||[]).map(x=>String(x).trim()).filter(Boolean);
   if(!poNums.length){ r.el.innerHTML='<span class="dtag err">pickup request</span> no PO number found in this email'; return; }
-  const matched=[], missing=[];
+  const matched=[], missing=[], created=[];
   for(const n of poNums){
     const clean=n.replace(/\s+/g,''), b=basePO(n);
     const hits=pickups.filter(p=>(p.pos||[]).some(po=>{const pn=String(po.poNumber||'').replace(/\s+/g,''); return pn===clean||basePO(pn)===b;}));
     if(hits.length) hits.forEach(h=>{ if(!matched.includes(h)) matched.push(h); });
-    else missing.push(n);
+    else{
+      // PO not in system -> create a fresh minimal record with just PO + ready date
+      const rec={ id:uid(), createdAt:new Date().toISOString(), savedAt:new Date().toISOString(), awb:'',
+        transportCost:null, transportCurrency:'USD', source:'email',
+        pos:[{ poNumber:n, supplier:q.requestedBy||'', dg:false, weightKg:null, dims:null, pieces:null, lines:[] }],
+        dgDocs:[], docs:[] };
+      pickups.unshift(rec); matched.push(rec); created.push(n);
+    }
   }
   let saved=0;
   for(const rec of matched){
@@ -851,7 +858,7 @@ async function applyPickupRequest(r){
   const parts=[];
   parts.push(date?('📅 '+esc(fmtNL(date))):'<span style="color:var(--danger)">no date found — click 📅 on the PO to set it</span>');
   parts.push('→ <b>'+matched.length+'</b> PO(s) updated');
-  if(missing.length) parts.push('<span style="color:var(--danger)">not in system: '+esc(missing.join(', '))+'</span>');
+  if(created.length) parts.push('new PO added: <b>'+esc(created.join(', '))+'</b>');
   r.el.innerHTML='<span class="dtag dhl">pickup request</span> '+parts.join(' · ');
   if(matched.length) toast('Pickup date saved on '+matched.length+' PO(s)');
 }
