@@ -33,7 +33,59 @@ const CORS = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
 
-export default async ({ req, res }) => {
+export default async ({ req, res, log, error }) => {
+ // ============================================================
+// TDW TRACKER — AI extraction mode for the existing tdw-extract
+// Appwrite function (Node). PASTE THIS BLOCK AT THE TOP OF YOUR
+// HANDLER, before the existing TDWINBOUND logic. It only fires
+// when the request has mode:"tracker", so TDWINBOUND is untouched.
+//
+// Requirements (already true for tdw-extract):
+//   - env var ANTHROPIC_API_KEY set on the function
+//   - execute permission for role "any"
+// ============================================================
+
+// inside: export default async ({ req, res, log, error }) => {
+
+const _b = req.bodyJson ?? (typeof req.body === 'object' && req.body ? req.body : (() => { try { return JSON.parse(req.bodyRaw || req.body || '{}'); } catch { return {}; } })());
+
+if (_b && _b.mode === 'tracker') {
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 4000,
+        messages: [{
+          role: 'user',
+          content:
+`Extract shipment data for a freight tracker from the document below.
+Return ONLY a JSON object, no markdown: {"rows":[{...}]} — one object per shipment; split if the document contains several shipments.
+Allowed keys per object (string or null; never invent a value): ${JSON.stringify(_b.fields)}
+Rules: ${_b.rules}
+Known vessels (match against these, return the exact listed spelling): ${JSON.stringify(_b.vessels)}
+Vessel→destination/agent map (when a vessel matches, fill dest and agent from it): ${JSON.stringify(_b.vessel_map)}
+DOCUMENT:
+${_b.text}`
+        }],
+      }),
+    });
+    const data = await r.json();
+    const txt = (data.content || []).filter(c => c.type === 'text').map(c => c.text).join('');
+    const m = txt.match(/\{[\s\S]*\}/);
+    return res.json(JSON.parse(m ? m[0] : '{"rows":[]}'));
+  } catch (e) {
+    error('tracker extract failed: ' + e.message);
+    return res.json({ rows: [], error: String(e.message) });
+  }
+}
+
+// --- end tracker mode; existing tdw-extract (TDWINBOUND) logic continues below ---
   if (req.method === 'OPTIONS') return res.text('', 204, CORS);
   if (req.method !== 'POST') return res.json({ error: 'Method not allowed' }, 405, CORS);
 
